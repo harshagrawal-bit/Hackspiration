@@ -8,6 +8,8 @@ Indian retail investors use multiple brokers (Zerodha, Groww, Angel One) but hav
 - Real-time risk metrics (Volatility, VaR, Sharpe Ratio)
 - AI-powered insights in beginner-friendly language
 - Immutable proof of portfolio state over time
+- Hidden concentrations - 42% in one stock across platforms without realizing
+-  Global shock ignorance - don't know how US crash affects their Indian holdings
 
 ## 💡 Solution
 
@@ -16,6 +18,7 @@ A web platform that:
 2. **Analyzes** risk using advanced metrics (Sharpe ratio, VaR, Max Drawdown)
 3. **Explains** risk using AI (Gemini) in simple language
 4. **Stores** immutable portfolio snapshots on Algorand blockchain
+5. 
 
 ---
 
@@ -256,17 +259,15 @@ uvicorn api:app --reload --host 0.0.0.0 --port 8000
 
 ## 👥 Team
 
-**Harsh Agrawal** - Full Stack Developer
+**Harsh Agrawal** 
+**Sahil Chaudhari**
+**Nayan Hatwar**
 
 ---
 
-## 📄 License
-
-MIT License - Built for Hackspiration'26
-
 ---
 
-## 🙏 Acknowledgments
+##  Acknowledgments
 
 - **Algorand** - Title sponsor and blockchain infrastructure
 - **Google Gemini** - AI-powered insights
