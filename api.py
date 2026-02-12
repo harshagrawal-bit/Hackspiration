@@ -1,23 +1,53 @@
 from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import os
+import hashlib
+import json
+import re
+import io
+from datetime import datetime
 from dotenv import load_dotenv
+import PyPDF2
+import pdfplumber
+from algosdk import account, mnemonic, transaction
+from algosdk.v2client import algod, indexer
 
 # Load environment variables
 load_dotenv()
 
 app = FastAPI(title="Portfolio & Risk Analysis API")
 
+# CORS middleware — allow frontend to call API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Serve static frontend files
+os.makedirs("static", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 # Configure Gemini API
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-pro')
+    client = genai.Client(api_key=GEMINI_API_KEY)
 else:
-    model = None
+    client = None
+
+# Configure Algorand
+ALGORAND_ALGOD_ADDRESS = os.getenv("ALGORAND_ALGOD_ADDRESS", "https://testnet-api.algonode.cloud")
+ALGORAND_ALGOD_TOKEN = os.getenv("ALGORAND_ALGOD_TOKEN", "")
+ALGORAND_PRIVATE_KEY = os.getenv("ALGORAND_PRIVATE_KEY", "")
+ALGORAND_ADDRESS = os.getenv("ALGORAND_ADDRESS", "")
 
 # -----------------------------
 # Utility functions
@@ -32,6 +62,163 @@ def fetch_prices(symbols, period="6mo"):
     data = yf.download(symbols, period=period)["Close"]
     return data.dropna()
 
+def parse_cas_pdf(pdf_file):
+    """
+    Parse CAS (Consolidated Account Statement) PDF to extract holdings.
+    Supports common broker formats (Zerodha, Groww, Angel, etc.)
+    Returns a DataFrame with columns: symbol, quantity, price
+    """
+    holdings = []
+    
+    try:
+        # Read PDF content
+        pdf_content = pdf_file.read()
+        pdf_file.seek(0)  # Reset file pointer
+        
+        # Try pdfplumber first (better for tables)
+        with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if not text:
+                    continue
+                
+                # Pattern matching for common formats:
+                # Look for lines like: "AAPL    10    180.50" or "MSFT | 5 | 420.00"
+                # Common patterns in CAS:
+                # - Symbol/ISIN followed by quantity and price
+                # - May have separators like |, tabs, or multiple spaces
+                
+                lines = text.split('\n')
+                for line in lines:
+                    # Skip headers and empty lines
+                    if not line.strip() or 'symbol' in line.lower() or 'isin' in line.lower():
+                        continue
+                    
+                    # Pattern 1: Symbol Quantity Price (space/tab separated)
+                    # Example: "AAPL    10    180.50"
+                    match = re.search(r'([A-Z]{2,5})\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)', line)
+                    if match:
+                        symbol, qty, price = match.groups()
+                        holdings.append({
+                            'symbol': symbol,
+                            'quantity': float(qty),
+                            'price': float(price)
+                        })
+                        continue
+                    
+                    # Pattern 2: Pipe-separated (|)
+                    # Example: "MSFT | 5 | 420.00"
+                    parts = [p.strip() for p in line.split('|')]
+                    if len(parts) >= 3:
+                        try:
+                            symbol = parts[0]
+                            qty = float(parts[1])
+                            price = float(parts[2])
+                            if symbol.isalpha() and len(symbol) <= 5:
+                                holdings.append({
+                                    'symbol': symbol,
+                                    'quantity': qty,
+                                    'price': price
+                                })
+                        except (ValueError, IndexError):
+                            continue
+        
+        # Fallback to PyPDF2 if pdfplumber didn't find anything
+        if not holdings:
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_content))
+            for page in pdf_reader.pages:
+                text = page.extract_text()
+                lines = text.split('\n')
+                for line in lines:
+                    match = re.search(r'([A-Z]{2,5})\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)', line)
+                    if match:
+                        symbol, qty, price = match.groups()
+                        holdings.append({
+                            'symbol': symbol,
+                            'quantity': float(qty),
+                            'price': float(price)
+                        })
+    
+    except Exception as e:
+        raise ValueError(f"Failed to parse PDF: {str(e)}")
+    
+    if not holdings:
+        raise ValueError("No holdings found in PDF. Please ensure it's a valid CAS/broker statement.")
+    
+    df = pd.DataFrame(holdings)
+    df['investment'] = df['quantity'] * df['price']
+    return df
+
+def get_algorand_client():
+    """
+    Initialize Algorand client for TestNet.
+    """
+    return algod.AlgodClient(ALGORAND_ALGOD_TOKEN, ALGORAND_ALGOD_ADDRESS)
+
+def submit_to_algorand(snapshot_hash, portfolio_data):
+    """
+    Submit portfolio snapshot to Algorand blockchain.
+    Creates a 0-ALGO transaction to self with snapshot hash in note field.
+    Returns transaction ID and explorer link.
+    """
+    if not ALGORAND_PRIVATE_KEY or not ALGORAND_ADDRESS:
+        return {
+            "status": "simulation",
+            "message": "Algorand credentials not configured. Running in simulation mode.",
+            "simulated_tx_id": f"SIM{snapshot_hash[:16]}",
+            "explorer_link": "https://testnet.algoexplorer.io/tx/SIMULATION_MODE",
+            "note": "Add ALGORAND_PRIVATE_KEY and ALGORAND_ADDRESS to .env to enable real blockchain submission"
+        }
+    
+    try:
+        algod_client = get_algorand_client()
+        
+        # Get suggested parameters
+        params = algod_client.suggested_params()
+        
+        # Create note field (max 1KB)
+        note_data = {
+            "snapshot_hash": snapshot_hash,
+            "timestamp": portfolio_data.get("timestamp"),
+            "total_value": portfolio_data.get("total_value"),
+            "num_holdings": portfolio_data.get("num_holdings")
+        }
+        note = json.dumps(note_data).encode()
+        
+        # Create transaction (0 ALGO to self)
+        txn = transaction.PaymentTxn(
+            sender=ALGORAND_ADDRESS,
+            sp=params,
+            receiver=ALGORAND_ADDRESS,
+            amt=0,
+            note=note
+        )
+        
+        # Sign transaction
+        signed_txn = txn.sign(ALGORAND_PRIVATE_KEY)
+        
+        # Submit transaction
+        tx_id = algod_client.send_transaction(signed_txn)
+        
+        # Wait for confirmation
+        transaction.wait_for_confirmation(algod_client, tx_id, 4)
+        
+        return {
+            "status": "success",
+            "tx_id": tx_id,
+            "explorer_link": f"https://testnet.algoexplorer.io/tx/{tx_id}",
+            "network": "TestNet",
+            "fee": params.fee / 1_000_000,  # Convert microAlgos to ALGO
+            "message": "Portfolio snapshot successfully submitted to Algorand blockchain"
+        }
+    
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to submit to Algorand: {str(e)}",
+            "error_details": str(e)
+        }
+
 # -----------------------------
 # Health check
 # -----------------------------
@@ -41,19 +228,49 @@ def health():
     return {"status": "Backend running successfully 🚀"}
 
 # -----------------------------
-# Upload portfolio CSV
+# Upload portfolio (CSV or PDF)
 # -----------------------------
 
 @app.post("/upload")
 async def upload_portfolio(file: UploadFile = File(...)):
-    df = pd.read_csv(file.file)
-    df["investment"] = df["quantity"] * df["price"]
-
-    return {
-        "message": "Portfolio uploaded successfully",
-        "total_investment": float(df["investment"].sum()),
-        "assets": df.to_dict(orient="records")
-    }
+    """
+    Upload portfolio from CSV or CAS PDF.
+    Accepts: .csv, .pdf files
+    """
+    filename = file.filename.lower()
+    
+    try:
+        if filename.endswith('.csv'):
+            df = pd.read_csv(file.file)
+            if 'investment' not in df.columns:
+                df["investment"] = df["quantity"] * df["price"]
+        
+        elif filename.endswith('.pdf'):
+            df = parse_cas_pdf(file.file)
+        
+        else:
+            return {
+                "error": "Unsupported file type. Please upload CSV or PDF.",
+                "status": "failed"
+            }
+        
+        # Save uploaded portfolio as current portfolio
+        df[["symbol", "quantity", "price"]].to_csv("sample.csv", index=False)
+        
+        return {
+            "message": f"Portfolio uploaded successfully from {file.filename}",
+            "file_type": "PDF (CAS)" if filename.endswith('.pdf') else "CSV",
+            "total_investment": float(df["investment"].sum()),
+            "num_holdings": len(df),
+            "assets": df[["symbol", "quantity", "price"]].to_dict(orient="records")
+        }
+    
+    except Exception as e:
+        return {
+            "error": str(e),
+            "status": "failed",
+            "message": "Failed to parse file. Ensure it's a valid CSV or CAS PDF."
+        }
 
 # -----------------------------
 # Portfolio summary
@@ -88,7 +305,12 @@ def portfolio_risk():
     prices = fetch_prices(symbols)
     returns = prices.pct_change().dropna()
 
-    portfolio_returns = returns.mean(axis=1)
+    # Weighted portfolio returns based on actual allocation
+    total_investment = df["investment"].sum()
+    weights = (df.set_index("symbol")["investment"] / total_investment)
+    # Align weights with returns columns
+    aligned_weights = weights.reindex(returns.columns).fillna(0).values
+    portfolio_returns = (returns * aligned_weights).sum(axis=1)
 
     volatility = portfolio_returns.std() * np.sqrt(252)
     var_95 = np.percentile(portfolio_returns, 5)
@@ -98,10 +320,17 @@ def portfolio_risk():
         - 1
     ).min()
 
+    # Sharpe Ratio (assuming risk-free rate of 5% for India)
+    risk_free_rate = 0.05
+    annual_return = portfolio_returns.mean() * 252
+    sharpe_ratio = (annual_return - risk_free_rate) / volatility if volatility > 0 else 0
+
     return {
         "volatility": float(volatility),
         "value_at_risk_95": float(var_95),
-        "max_drawdown": float(max_drawdown)
+        "max_drawdown": float(max_drawdown),
+        "sharpe_ratio": float(sharpe_ratio),
+        "annual_return": float(annual_return)
     }
 
 # -----------------------------
@@ -152,9 +381,12 @@ Keep the language simple and actionable. No jargon.
 """
     
     # Use Gemini AI if available, otherwise fallback
-    if model:
+    if client:
         try:
-            response = model.generate_content(portfolio_context)
+            response = client.models.generate_content(
+                model='gemini-2.0-flash-exp',
+                contents=portfolio_context
+            )
             ai_explanation = response.text
         except Exception as e:
             ai_explanation = f"AI service temporarily unavailable. Error: {str(e)}\n\nFallback analysis: Your portfolio shows moderate risk with {risk_data['volatility']*100:.2f}% volatility. Consider diversification if concentration exceeds 30% in any asset."
@@ -181,7 +413,7 @@ The Value at Risk tells you that on the worst 5% of days, you might lose {abs(ri
     
     return {
         "status": "success",
-        "ai_powered": model is not None,
+        "ai_powered": bool(client),
         "insights": ai_explanation,
         "risk_summary": {
             "volatility_pct": float(risk_data['volatility'] * 100),
@@ -228,4 +460,66 @@ def market_context():
     return {
         "indices": results,
         "timestamp": pd.Timestamp.now().isoformat()
+    }
+
+# -----------------------------
+# Portfolio Snapshot (Blockchain-ready)
+# -----------------------------
+
+@app.get("/snapshot")
+def portfolio_snapshot():
+    """
+    Generate a tamper-proof SHA-256 hash of the portfolio.
+    This hash + timestamp can be stored on Algorand for immutable proof.
+    """
+    df = load_portfolio()
+    timestamp = datetime.utcnow().isoformat() + "Z"
+
+    # Create deterministic portfolio representation
+    portfolio_data = {
+        "holdings": df[["symbol", "quantity", "price"]].to_dict(orient="records"),
+        "total_value": float(df["investment"].sum()),
+        "timestamp": timestamp
+    }
+
+    # Generate SHA-256 hash
+    data_string = json.dumps(portfolio_data, sort_keys=True)
+    snapshot_hash = hashlib.sha256(data_string.encode()).hexdigest()
+
+    return {
+        "snapshot_hash": snapshot_hash,
+        "timestamp": timestamp,
+        "total_value": float(df["investment"].sum()),
+        "num_holdings": len(df),
+        "holdings": df["symbol"].tolist(),
+        "blockchain_ready": {
+            "note_field": data_string[:1000],  # Algorand note field max ~1KB
+            "hash": snapshot_hash,
+            "status": "Ready for Algorand submission"
+        }
+    }
+
+@app.post("/snapshot/submit")
+def submit_snapshot_to_algorand():
+    """
+    Submit the current portfolio snapshot to Algorand blockchain.
+    Works in simulation mode if credentials are not configured.
+    """
+    # Generate snapshot
+    snapshot_data = portfolio_snapshot()
+    
+    # Submit to Algorand
+    result = submit_to_algorand(
+        snapshot_data["snapshot_hash"],
+        {
+            "timestamp": snapshot_data["timestamp"],
+            "total_value": snapshot_data["total_value"],
+            "num_holdings": snapshot_data["num_holdings"]
+        }
+    )
+    
+    # Combine snapshot data with blockchain result
+    return {
+        **snapshot_data,
+        "algorand_submission": result
     }

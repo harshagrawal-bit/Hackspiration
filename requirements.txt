@@ -4,5 +4,8 @@ pandas
 numpy
 yfinance
 python-multipart
-google-generativeai
+google-genai
 python-dotenv
+PyPDF2
+pdfplumber
+py-algorand-sdk
